@@ -1,0 +1,13 @@
+{
+    "display_name": "Throughline",
+    "loading_order": 60,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "GrayAegis",
+    "version": "0.1.0",
+    "homePage": "https://github.com/GrayAegis/Throughline",
+    "description": "Story-scoped memory that rides in the chat file and is inherited by every branch. Time-ranged facts plus an optional compressed narrative spine. No lorebooks, no Data Bank.",
+    "auto_update": false
+}
