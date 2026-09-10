@@ -34,7 +34,10 @@ const EXTRACTION_SCHEMA = {
     },
 };
 
-/** The window of unprocessed messages, held back by the buffer so the tail stays live. */
+/**
+ * The window of unprocessed messages, held back by the buffer so the tail stays live.
+ * `count` is the next batch; `total` is the whole backlog behind the buffer.
+ */
 export function pendingRange() {
     const settings = getSettings();
     const store = getStore();
@@ -43,7 +46,21 @@ export function pendingRange() {
     const end = chat.length - 1 - Math.max(0, settings.buffer);
     if (end < start) return null;
     const capped = Math.min(end, start + Math.max(1, settings.maxBatch) - 1);
-    return { start, end: capped, count: capped - start + 1 };
+    return { start, end: capped, count: capped - start + 1, total: end - start + 1 };
+}
+
+/** Escape hatch for a busy flag left behind by a call that never came back. */
+export function resetRunning() {
+    running = false;
+}
+
+function withTimeout(promise, seconds, label) {
+    if (!seconds || seconds <= 0) return promise;
+    let timer;
+    const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${seconds} seconds`)), seconds * 1000);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 function buildDigest(store, limit = 80) {
@@ -108,22 +125,22 @@ async function callModel(system, user, { schema = null, maxTokens } = {}) {
             { role: 'system', content: system },
             { role: 'user', content: user },
         ];
-        const extracted = await context.ConnectionManagerRequestService.sendRequest(
+        const extracted = await withTimeout(context.ConnectionManagerRequestService.sendRequest(
             profileId,
             messages,
             responseLength,
             { stream: false, extractData: true },
             schema ? { json_schema: schema } : {},
-        );
+        ), settings.timeoutSeconds, 'Memory request');
         // With a schema the service hands back content already parsed into an object.
         result = (extracted && typeof extracted === 'object' && 'content' in extracted) ? extracted.content : extracted;
     } else {
-        result = await context.generateRaw({
+        result = await withTimeout(context.generateRaw({
             prompt: user,
             systemPrompt: system,
             responseLength,
             jsonSchema: schema,
-        });
+        }), settings.timeoutSeconds, 'Memory request');
     }
 
     if (settings.debug) log('response <<<', result);

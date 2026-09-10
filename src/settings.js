@@ -96,6 +96,8 @@ export const defaultSettings = Object.freeze({
     // Model
     profileId: '',
     maxResponseTokens: 1200,
+    timeoutSeconds: 180,
+    catchUpBatches: 6,
 
     // Prompts
     systemPrompt: EXTRACT_SYSTEM_PROMPT,

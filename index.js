@@ -1,7 +1,7 @@
 import { MODULE, ctx, log, debounce, escapeHtml } from './src/util.js';
 import { getSettings, saveSettings, defaultSettings } from './src/settings.js';
 import { getStore, syncLineage, storeStats, saveStore } from './src/store.js';
-import { runExtraction, pendingRange, isRunning } from './src/extract.js';
+import { runExtraction, pendingRange, isRunning, resetRunning } from './src/extract.js';
 import { refreshInjection, getLastBlock } from './src/inject.js';
 import { applyGhosting, unghostAll } from './src/ghost.js';
 import { openPanel, exportStore, importStore } from './src/panel.js';
@@ -50,6 +50,8 @@ function settingsHtml() {
                 <input type="number" id="tl_maxbatch" class="text_pole" min="2" max="200">
                 <label for="tl_profile">Connection profile for memory work</label>
                 <select id="tl_profile" class="text_pole"></select>
+                <label for="tl_timeout">Give up on a memory request after this many seconds</label>
+                <input type="number" id="tl_timeout" class="text_pole" min="10" max="900">
                 <label class="checkbox_label"><input type="checkbox" id="tl_schema"> Request structured JSON output</label>
                 <label class="checkbox_label"><input type="checkbox" id="tl_debug"> Log prompts and raw responses to the browser console</label>
 
@@ -109,9 +111,16 @@ export function refreshStatus() {
     const block = getLastBlock();
     const settings = getSettings();
 
+    const waiting = !pending
+        ? 'nothing waiting'
+        : pending.total > pending.count
+            ? `${pending.total} waiting, next batch ${pending.count}`
+            : `${pending.total} waiting`;
+    const busy = isRunning() ? ' <span class="tl-dim">(extracting)</span>' : '';
+
     el.innerHTML = `
         <div>${stats.active} active facts, ${stats.pinned} pinned, ${stats.snippets} spine snippets</div>
-        <div>Remembered up to message ${Math.max(0, store.cursor - 1)}${pending ? `, ${pending.count} waiting` : ', nothing waiting'}</div>
+        <div>Remembered up to message ${Math.max(0, store.cursor - 1)}, ${waiting}${busy}</div>
         <div>Injecting ${block.tokens} tokens of ${settings.budgetTokens}${block.dropped ? `, ${block.dropped} facts dropped` : ''}</div>
         ${store.lineage.parent ? `<div class="tl-dim">Inherited from ${escapeHtml(store.lineage.parent)}</div>` : ''}`;
 }
@@ -170,6 +179,7 @@ function bindSettings() {
     number('tl_interval', 'interval', refreshStatus);
     number('tl_buffer', 'buffer', refreshStatus);
     number('tl_maxbatch', 'maxBatch');
+    number('tl_timeout', 'timeoutSeconds');
     number('tl_verbatim', 'verbatimTurns', async () => { await applyGhosting(); refreshStatus(); });
     number('tl_budget', 'budgetTokens', reinject);
     number('tl_depth', 'depth', reinject);
@@ -243,10 +253,11 @@ async function extractAndApply(range = null, manual = false) {
     const settings = getSettings();
     if (!settings.enabled) return;
     if (isRunning()) {
-        if (manual) notify('Already running');
+        if (manual) toastr.warning('An extraction is still running. If this never clears, use /tl-reset.', 'Throughline', { timeOut: 6000 });
         return;
     }
 
+    refreshStatus();
     const result = await runExtraction(range);
     if (!result.ok) {
         // A failed run leaves the passage pending, so say so even when it was automatic.
@@ -267,12 +278,26 @@ async function extractAndApply(range = null, manual = false) {
     notify(bits.length ? `Remembered ${span}: ${bits.join(', ')}` : `Nothing durable in ${span}`, 'success');
 }
 
+/**
+ * Drain the backlog a batch at a time. One batch per new message could never catch up
+ * with a chat that got ahead of it, so this keeps going while the backlog is still
+ * over the interval, bounded so a broken run cannot loop forever.
+ */
 const maybeAutoExtract = debounce(async () => {
     const settings = getSettings();
     if (!settings.enabled || !settings.autoExtract) return;
-    const pending = pendingRange();
-    if (!pending || pending.count < settings.interval) return;
-    await extractAndApply();
+    const chatAtStart = getStore().lineage.chat;
+
+    for (let i = 0; i < Math.max(1, settings.catchUpBatches); i++) {
+        const pending = pendingRange();
+        if (!pending || pending.total < settings.interval) return;
+        if (isRunning()) return;
+        if (getStore().lineage.chat !== chatAtStart) return;
+
+        const before = getStore().cursor;
+        await extractAndApply();
+        if (getStore().cursor <= before) return;
+    }
 }, 1200);
 
 const onChatEvent = debounce(async () => {
@@ -365,6 +390,17 @@ function registerCommands() {
         helpString: 'Return the memory block currently being injected.',
         callback: async () => (await refreshInjection()).text,
     }));
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'tl-reset',
+        helpString: 'Clear a stuck "extraction running" state without reloading.',
+        callback: async () => {
+            resetRunning();
+            refreshStatus();
+            notify('Busy flag cleared');
+            return '';
+        },
+    }));
 }
 
 /* ------------------------------------------------------------------ boot */
@@ -399,10 +435,16 @@ jQuery(async () => {
         addMessageButtons();
         await refreshInjection();
         refreshStatus();
+        maybeAutoExtract();
     });
 
     eventSource.on(eventTypes.MESSAGE_RECEIVED, () => { onChatEvent(); maybeAutoExtract(); });
     eventSource.on(eventTypes.MESSAGE_SENT, () => { onChatEvent(); });
+
+    // Rendered events fire for streamed replies too, so the status line cannot fall behind the chat.
+    for (const event of [eventTypes.USER_MESSAGE_RENDERED, eventTypes.CHARACTER_MESSAGE_RENDERED]) {
+        eventSource.on(event, () => { onChatEvent(); });
+    }
 
     for (const event of [eventTypes.MESSAGE_DELETED, eventTypes.MESSAGE_EDITED, eventTypes.MESSAGE_SWIPED]) {
         eventSource.on(event, () => { syncLineage(); onChatEvent(); });
