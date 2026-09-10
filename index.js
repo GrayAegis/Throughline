@@ -51,6 +51,7 @@ function settingsHtml() {
                 <label for="tl_profile">Connection profile for memory work</label>
                 <select id="tl_profile" class="text_pole"></select>
                 <label class="checkbox_label"><input type="checkbox" id="tl_schema"> Request structured JSON output</label>
+                <label class="checkbox_label"><input type="checkbox" id="tl_debug"> Log prompts and raw responses to the browser console</label>
 
                 <hr>
                 <h4>Context</h4>
@@ -160,6 +161,7 @@ function bindSettings() {
     checkbox('tl_perception', 'perception', reinject);
     checkbox('tl_auto', 'autoExtract');
     checkbox('tl_schema', 'useJsonSchema');
+    checkbox('tl_debug', 'debug');
     checkbox('tl_ghosting', 'ghosting', async () => {
         if (!settings.ghosting) await unghostAll();
         else await applyGhosting();
@@ -247,7 +249,9 @@ async function extractAndApply(range = null, manual = false) {
 
     const result = await runExtraction(range);
     if (!result.ok) {
-        if (manual) notify(result.reason);
+        // A failed run leaves the passage pending, so say so even when it was automatic.
+        const quiet = !manual && (result.reason === 'nothing to process' || result.reason === 'already running');
+        if (!quiet) toastr.warning(`Extraction failed: ${result.reason}`, 'Throughline', { timeOut: 8000 });
         return;
     }
 
@@ -255,11 +259,12 @@ async function extractAndApply(range = null, manual = false) {
     await refreshInjection();
     refreshStatus();
 
+    const span = `messages ${result.range.start} to ${result.range.end}`;
     const bits = [];
     if (result.added) bits.push(`${result.added} facts`);
     if (result.retired) bits.push(`${result.retired} retired`);
     if (result.snippet) bits.push('spine updated');
-    notify(bits.length ? `Remembered: ${bits.join(', ')}` : 'Nothing new to remember', 'success');
+    notify(bits.length ? `Remembered ${span}: ${bits.join(', ')}` : `Nothing durable in ${span}`, 'success');
 }
 
 const maybeAutoExtract = debounce(async () => {

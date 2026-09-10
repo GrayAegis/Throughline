@@ -1,4 +1,4 @@
-import { ctx, log, warn, parseJsonLoose, messageText } from './util.js';
+import { ctx, log, warn, parseJsonLoose, messageText, GHOST_FLAG } from './util.js';
 import { getSettings } from './settings.js';
 import {
     getStore, saveStore, addFact, retireFact, addSnippet, activeFacts,
@@ -71,6 +71,8 @@ function buildTranscript(start, end) {
     for (let i = start; i <= end; i++) {
         const m = chat[i];
         if (!m) continue;
+        // Skip what the user excluded from the prompt by hand. Our own hides sit below the cursor.
+        if (m.is_system && !m.extra?.[GHOST_FLAG]) continue;
         const text = messageText(m);
         if (!text) continue;
         lines.push(`[${i}] ${m.name}: ${text}`);
@@ -87,35 +89,72 @@ function fill(template, vars) {
 
 /**
  * One call, over whichever connection the user picked. A named profile keeps memory work
- * off the model doing the roleplay; the empty profile just uses the live connection.
+ * off the model doing the roleplay; the empty profile uses the live connection through
+ * generateRaw, which sends only this prompt rather than the whole chat with it appended.
+ *
+ * Returns either a string or, when SillyTavern has already parsed structured output, an object.
  */
 async function callModel(system, user, { schema = null, maxTokens } = {}) {
     const context = ctx();
     const settings = getSettings();
     const profileId = settings.profileId;
+    const responseLength = maxTokens ?? settings.maxResponseTokens;
 
+    if (settings.debug) log('prompt >>>\n' + system + '\n\n' + user);
+
+    let result;
     if (profileId) {
         const messages = [
             { role: 'system', content: system },
             { role: 'user', content: user },
         ];
-        const result = await context.ConnectionManagerRequestService.sendRequest(
+        const extracted = await context.ConnectionManagerRequestService.sendRequest(
             profileId,
             messages,
-            maxTokens ?? settings.maxResponseTokens,
+            responseLength,
             { stream: false, extractData: true },
             schema ? { json_schema: schema } : {},
         );
-        return typeof result === 'string' ? result : (result?.content ?? '');
+        // With a schema the service hands back content already parsed into an object.
+        result = (extracted && typeof extracted === 'object' && 'content' in extracted) ? extracted.content : extracted;
+    } else {
+        result = await context.generateRaw({
+            prompt: user,
+            systemPrompt: system,
+            responseLength,
+            jsonSchema: schema,
+        });
     }
 
-    return await context.generateQuietPrompt({
-        quietPrompt: `${system}\n\n${user}`,
-        responseLength: maxTokens ?? settings.maxResponseTokens,
-        skipWIAN: true,
-        jsonSchema: schema,
-        trimToSentence: false,
-    });
+    if (settings.debug) log('response <<<', result);
+    return result;
+}
+
+/**
+ * Turn whatever came back into the extraction object, or null if it is not one.
+ *
+ * SillyTavern's JSON extractor returns the string "{}" when it finds no JSON at all, so an
+ * empty object is a failed call, not a passage with nothing in it. A real "nothing new"
+ * answer still carries the keys. Some providers also wrap the payload one level deep.
+ */
+export function interpretResponse(raw) {
+    let parsed = raw;
+    if (typeof raw === 'string') parsed = parseJsonLoose(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+
+    const looksRight = (obj) => obj && typeof obj === 'object' && (Array.isArray(obj.facts) || typeof obj.spine === 'string');
+
+    if (!looksRight(parsed)) {
+        const inner = Object.values(parsed).find(looksRight);
+        if (!inner) return null;
+        parsed = inner;
+    }
+
+    return {
+        spine: typeof parsed.spine === 'string' ? parsed.spine : '',
+        facts: Array.isArray(parsed.facts) ? parsed.facts : [],
+        retire: Array.isArray(parsed.retire) ? parsed.retire : [],
+    };
 }
 
 /**
@@ -153,10 +192,13 @@ export async function runExtraction(range = null) {
             schema: settings.useJsonSchema ? EXTRACTION_SCHEMA : null,
         });
 
-        const parsed = parseJsonLoose(raw);
+        const parsed = interpretResponse(raw);
         if (!parsed) {
-            warn('could not parse extraction response', raw);
-            return { ok: false, reason: 'the model did not return usable JSON' };
+            warn('extraction response was not usable, leaving the passage for next time. Raw response:', raw);
+            const hint = settings.useJsonSchema
+                ? ' Turn on debug logging to see the raw response, or try turning off structured JSON output.'
+                : ' Turn on debug logging to see the raw response.';
+            return { ok: false, reason: 'the model did not return a usable extraction.' + hint, range: window };
         }
 
         let added = 0;

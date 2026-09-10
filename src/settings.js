@@ -106,6 +106,7 @@ export const defaultSettings = Object.freeze({
     // Chrome
     notify: true,
     useJsonSchema: true,
+    debug: false,
 });
 
 export function getSettings() {
